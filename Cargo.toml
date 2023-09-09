@@ -41,3 +41,7 @@ path = "src/main.rs"
 [[bin]]
 name = "gpio_reporter"
 path = "src/gpio_reporter_nointerrupt.rs"
+
+[[bin]]
+name = "adc_tester"
+path = "src/adc_tester.rs"
