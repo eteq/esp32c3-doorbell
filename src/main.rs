@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+
 use esp_backtrace as _;
 use esp_println::println;
 use hal::{
@@ -14,48 +15,47 @@ use hal::{
     rmt::{PulseCode, TxChannel, TxChannelConfig, TxChannelCreator},
 };
 
-//#[macro_use]
-//extern crate alloc;
-//#[global_allocator]
-//static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
 
 use heapless;
 
-//use critical_section::Mutex;
-
-use embedded_svc::io::*;
 use embedded_svc::ipv4::Interface;
 use embedded_svc::wifi::{AccessPointInfo, ClientConfiguration, Configuration, Wifi};
 
 use esp_wifi;
 use esp_wifi::wifi::{WifiMode, WifiError};
-use esp_wifi::wifi_interface::{WifiStack, Socket};
+use esp_wifi::wifi_interface::WifiStack;
+//use esp_wifi::wifi_interface::{WifiStack, Socket};
 use esp_wifi::wifi::utils::create_network_interface;
 use smoltcp;
-use smoltcp::wire::{IpAddress, Ipv4Address};
+//use smoltcp::wire::{IpAddress, Ipv4Address};
 
 use ringbuf::{StaticRb, ring_buffer::Rb};
 
-use micromath::F32Ext;
-
 // parameters
 const VERBOSE: bool = true;
+
+const SHORT_BUFFER_SIZE : usize = 11;  // should be odd for median to be right
 
 const BUFFER_SIZE: usize = 16;
 const RISE_WAIT_TIME_MS: u32 = 10;
 const SENSE_WAIT_TIME_MS: u32 = 10;
 const N_RETRY_CONNECT: usize = 10;
 const RETRY_DELAY_MS: usize = 100;
+const BUFFER_RESET_INTERVAL_TICKS: u64 = 3600 * SystemTimer::TICKS_PER_SECOND;  // once per hour
+
+// this is the fraction of the stored buffer that the median must be larger than to trigger
+const THRESHOLD_FRAC: [u32; 2] = [4, 3];
+// if a new value is smaller than this fraction of the largest value in the long buffer, it is added to the long buffer
+const STORE_FRAC: [u32; 2] = [11, 10];
 
 const SSID: &str = env!("SSID");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 
-const SEND_ADDRESS: Ipv4Address = Ipv4Address::new(192, 168, 1, 38);
-const SEND_PORT: u16 = 65432;
+//const SEND_ADDRESS: Ipv4Address = Ipv4Address::new(192, 168, 1, 38);
+//const SEND_PORT: u16 = 65432;
 
 // real consts
 const SENSE_WAIT_TIME_TICKS: u64 = SENSE_WAIT_TIME_MS as u64 * SystemTimer::TICKS_PER_SECOND/1000;
-const DIV_TICKS_TO_US: u64 = SystemTimer::TICKS_PER_SECOND / 1000000u64;
 
 #[entry]
 fn main() -> ! {
@@ -85,7 +85,7 @@ fn main() -> ! {
     wdt0.disable();
     wdt1.disable();
 
-    println!("Hello world!");
+    if VERBOSE { println!("Starting up!"); }
 
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
 
@@ -124,7 +124,7 @@ fn main() -> ! {
 
     let mut rx_buffer = [0u8; 1536];
     let mut tx_buffer = [0u8; 1536];
-    let mut socket = wifi_stack.get_socket(&mut rx_buffer, &mut tx_buffer);
+    let mut _socket = wifi_stack.get_socket(&mut rx_buffer, &mut tx_buffer);
 
     npx_channel = neopixel_transmit(npx_channel, 0, 0, 0).unwrap();
 
@@ -136,24 +136,31 @@ fn main() -> ! {
 
     //A3 = GPIO0 -> sense pin
     let sense_pin = io.pins.gpio0.into_floating_input();
-
-    //critical_section::with(|cs| SENSE_PIN.borrow_ref_mut(cs).replace(sense_pin));
     
     let mut delay = Delay::new(&clocks);
 
-    let mut rb = StaticRb::<u32, BUFFER_SIZE>::default();
-    let mut sum = 0u32;
-    let mut sumsq = 0u32;
-    let mut mean = 0.0;
-    let mut std = 0.0;
+    let mut short_buffer = [0u32; SHORT_BUFFER_SIZE];
+    let mut short_buffer_index = 0;
 
-    npx_channel = neopixel_transmit(npx_channel, 25, 25, 0).unwrap();
+    let mut long_buffer = StaticRb::<u32, BUFFER_SIZE>::default();
+    let mut long_buffer_sum = 0u32;
+
+    let mut last_buffer_reset = SystemTimer::now();
+
     loop {
-        let mut fall_time: Option<u64> = None;
-
-        if rb.len() == rb.capacity() {
+        if (SystemTimer::now() - last_buffer_reset) > BUFFER_RESET_INTERVAL_TICKS {
+            long_buffer.clear();
+            long_buffer_sum = 0;
+            // last_buffer_reset is reset to system time just below
+        }
+        if long_buffer.len() == long_buffer.capacity() {
             npx_channel = neopixel_transmit(npx_channel, 0, 25, 0).unwrap();
-        } 
+        } else {
+            npx_channel = neopixel_transmit(npx_channel, 25, 25, 0).unwrap();
+            last_buffer_reset = SystemTimer::now();
+        }
+
+        let mut fall_time: Option<u32> = None;
 
         charge_pin.set_high().unwrap();
         delay.delay_ms(RISE_WAIT_TIME_MS);
@@ -179,52 +186,59 @@ fn main() -> ! {
             });
 
             if sense_low {
-                fall_time = Some((t - start_time)/DIV_TICKS_TO_US);
+                fall_time = Some((t - start_time) as u32);
                 break;
             }
         }
 
         if fall_time != None {
-            let newval = fall_time.unwrap() as u32;
+            short_buffer[short_buffer_index] = fall_time.unwrap();
+            short_buffer_index += 1;
 
-            if (rb.capacity() == rb.len()) & (newval as f32 > (2.0*mean+3.0*std)) {
-                npx_channel = neopixel_transmit(npx_channel, 25, 0, 0).unwrap();
-                println!("triggered with value {} mean:{},std:{}", newval, mean, std);
-                delay.delay_ms(200u32);
-            } else {
-                println!("not triggered with value {} mean:{},std:{}", newval, mean, std);
-                let popval = rb.push_overwrite(newval);
-                (mean, std, sum, sumsq) = accumulate_stats(newval, popval, sum, sumsq, rb.len());
+            if short_buffer_index >= short_buffer.len() {
+                short_buffer_index = 0;  // reset median after this
+
+                short_buffer.sort_unstable();
+                let median = short_buffer[short_buffer.len()/2];
+
+                if long_buffer.len() < long_buffer.capacity() {
+                    if VERBOSE { println!("stored {} at init", median); }
+                    long_buffer.push_overwrite(median);
+                    long_buffer_sum += median;
+                } else {
+                    // add the median element in only if at least one of the existing buffer elements is larger  or equal
+                    let threshold_median = (median * STORE_FRAC[1]) / STORE_FRAC[0];
+                    'checkforstore: {
+                        for elem in long_buffer.iter() {
+                            if threshold_median <= (*elem) {
+                                if VERBOSE {
+                                    println!("stored {} because {} <= {}", median, threshold_median, *elem);
+                                    println!("long buffer: {:?}", long_buffer.iter().collect::<heapless::Vec<&u32, BUFFER_SIZE>>());
+                                }
+                                let popped_val = long_buffer.push_overwrite(median).unwrap();
+                                long_buffer_sum = long_buffer_sum - popped_val + median;
+                                break 'checkforstore;
+                            }
+                        }
+                        if VERBOSE {
+                            println!("did not store {}, too large", median);
+                            println!("long buffer: {:?}", long_buffer.iter().collect::<heapless::Vec<&u32, BUFFER_SIZE>>());
+                        }
+                    }
+
+                    // if the median meets the threshold, trigger
+                    if ((median * THRESHOLD_FRAC[1]) / THRESHOLD_FRAC[0]) > long_buffer_sum / long_buffer.len() as u32 {
+                        npx_channel = neopixel_transmit(npx_channel, 25, 0, 0).unwrap();
+                        delay.delay_ms(250u32);
+                        if VERBOSE {
+                            println!("triggered, because {} > {}, med:{}", (median * THRESHOLD_FRAC[1]) / THRESHOLD_FRAC[0], long_buffer_sum / long_buffer.len() as u32, median);
+                        }
+                    }
+                }
             }
-
-            
-
         }
-
     }
 }
-
-fn accumulate_stats(newval: u32, popvalo: Option<u32>, oldsum: u32, oldsumsq: u32, n: usize) -> (f32, f32, u32, u32) {
-    if n == 1 {
-        return (newval as f32, 0.0, newval, newval*newval)
-    } 
-    let popval = match popvalo {
-        None =>  {
-            0
-        }
-        Some(val) => {
-            val
-        }
-    };
-
-    let newsum = oldsum - popval + newval;
-    let newsumsq = oldsumsq - popval*popval + newval*newval;
-    let newmean = newsum as f32/n as f32;
-    let newstd = ((newsumsq as f32)/(n as f32) - newmean*newmean).sqrt();
-
-    (newmean, newstd, newsum, newsumsq)
-}
-
 
 fn neopixel_transmit(channel: hal::rmt::Channel0<0>, r: u8, g: u8, b: u8) -> Result<hal::rmt::Channel0<0>, (hal::rmt::Error, hal::rmt::Channel0<0>)>  {
     
