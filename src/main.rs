@@ -17,17 +17,18 @@ use hal::{
 
 
 use heapless;
+use core::fmt::Write;
 
+use embedded_svc::io::*;
 use embedded_svc::ipv4::Interface;
 use embedded_svc::wifi::{AccessPointInfo, ClientConfiguration, Configuration, Wifi};
 
 use esp_wifi;
 use esp_wifi::wifi::{WifiMode, WifiError};
-use esp_wifi::wifi_interface::WifiStack;
-//use esp_wifi::wifi_interface::{WifiStack, Socket};
+use esp_wifi::wifi_interface::{WifiStack, Socket};
 use esp_wifi::wifi::utils::create_network_interface;
 use smoltcp;
-//use smoltcp::wire::{IpAddress, Ipv4Address};
+use smoltcp::wire::{IpAddress, Ipv4Address};
 
 use ringbuf::{StaticRb, ring_buffer::Rb};
 
@@ -51,8 +52,8 @@ const STORE_FRAC: [u32; 2] = [11, 10];
 const SSID: &str = env!("SSID");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 
-//const SEND_ADDRESS: Ipv4Address = Ipv4Address::new(192, 168, 1, 38);
-//const SEND_PORT: u16 = 65432;
+const SEND_ADDRESS: Ipv4Address = Ipv4Address::new(192, 168, 1, 38);
+const SEND_PORT: u16 = 65434;
 
 // real consts
 const SENSE_WAIT_TIME_TICKS: u64 = SENSE_WAIT_TIME_MS as u64 * SystemTimer::TICKS_PER_SECOND/1000;
@@ -121,11 +122,14 @@ fn main() -> ! {
         panic!("Error while setting up wifi: {:?}", res.err());
     }
     let wifi_stack = res.unwrap();
-
     let mut rx_buffer = [0u8; 1536];
     let mut tx_buffer = [0u8; 1536];
-    let mut _socket = wifi_stack.get_socket(&mut rx_buffer, &mut tx_buffer);
-
+    //let mut socket = wifi_stack.get_socket(&mut rx_buffer, &mut tx_buffer);
+    let mut rx_meta = [smoltcp::socket::udp::PacketMetadata::EMPTY; 10];
+    let mut tx_meta = [smoltcp::socket::udp::PacketMetadata::EMPTY; 10];
+    let mut socket = wifi_stack.get_udp_socket(&mut rx_meta, &mut rx_buffer, &mut tx_meta, &mut tx_buffer);
+    socket.bind(SEND_PORT).unwrap();
+    
     npx_channel = neopixel_transmit(npx_channel, 0, 0, 0).unwrap();
 
     // set up the touch monitoring
@@ -148,6 +152,7 @@ fn main() -> ! {
     let mut last_buffer_reset = SystemTimer::now();
 
     loop {
+        socket.work();
         if (SystemTimer::now() - last_buffer_reset) > BUFFER_RESET_INTERVAL_TICKS {
             long_buffer.clear();
             long_buffer_sum = 0;
@@ -229,10 +234,37 @@ fn main() -> ! {
                     // if the median meets the threshold, trigger
                     if ((median * THRESHOLD_FRAC[1]) / THRESHOLD_FRAC[0]) > long_buffer_sum / long_buffer.len() as u32 {
                         npx_channel = neopixel_transmit(npx_channel, 25, 0, 0).unwrap();
-                        delay.delay_ms(250u32);
                         if VERBOSE {
                             println!("triggered, because {} > {}, med:{}", (median * THRESHOLD_FRAC[1]) / THRESHOLD_FRAC[0], long_buffer_sum / long_buffer.len() as u32, median);
                         }
+                        //delay.delay_ms(250u32);
+
+                        
+                        // UDP send
+                        let mut s: heapless::String<500> = heapless::String::new();
+                        write!(s, "triggered with fall time {}, long buffer:{:?}", median, long_buffer.iter().collect::<heapless::Vec<&u32, BUFFER_SIZE>>()).unwrap();
+                        socket.send(IpAddress::Ipv4(SEND_ADDRESS), SEND_PORT, s.as_bytes()).unwrap();
+
+                        // TCP send
+                        // socket.open(IpAddress::Ipv4(SEND_ADDRESS), SEND_PORT).unwrap();
+                        // write!(socket, "triggered with fall time {}", median).unwrap();
+                        //socket.flush().unwrap();
+
+                        let wait_end = SystemTimer::now() + SystemTimer::TICKS_PER_SECOND/4; // 250 ms
+                        while SystemTimer::now() < wait_end {
+                            socket.work();
+                        }
+
+                        // socket.disconnect();
+                    } else {
+                        let mut s: heapless::String<500> = heapless::String::new();
+                        write!(s, "did not trigger with fall time {}, long buffer:{:?}", median, long_buffer.iter().collect::<heapless::Vec<&u32, BUFFER_SIZE>>()).unwrap();
+                        socket.send(IpAddress::Ipv4(SEND_ADDRESS), SEND_PORT, s.as_bytes()).unwrap();
+                        let wait_end = SystemTimer::now() + SystemTimer::TICKS_PER_SECOND/4; // 250 ms
+                        while SystemTimer::now() < wait_end {
+                            socket.work();
+                        }
+                        
                     }
                 }
             }
