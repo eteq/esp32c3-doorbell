@@ -52,7 +52,7 @@ const STORE_FRAC: [u32; 2] = [11, 10];
 const SSID: &str = env!("SSID");
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 
-const SEND_ADDRESS: Ipv4Address = Ipv4Address::new(192, 168, 1, 38);
+const SEND_ADDRESS: Ipv4Address = Ipv4Address::new(192, 168, 1, 8);
 const SEND_PORT: u16 = 65434;
 
 // real consts
@@ -242,7 +242,11 @@ fn main() -> ! {
                         
                         // UDP send
                         let mut s: heapless::String<500> = heapless::String::new();
-                        write!(s, "triggered with fall time {}, long buffer:{:?}", median, long_buffer.iter().collect::<heapless::Vec<&u32, BUFFER_SIZE>>()).unwrap();
+                        write!(s, "triggered with fall time:{}\nlong buffer:{:?}\nshort buffer:{:?}", 
+                               median, 
+                               long_buffer.iter().collect::<heapless::Vec<&u32, BUFFER_SIZE>>(),
+                               short_buffer
+                            ).unwrap();
                         socket.send(IpAddress::Ipv4(SEND_ADDRESS), SEND_PORT, s.as_bytes()).unwrap();
 
                         // TCP send
@@ -258,8 +262,12 @@ fn main() -> ! {
                         // socket.disconnect();
                     } else {
                         let mut s: heapless::String<500> = heapless::String::new();
-                        write!(s, "did not trigger with fall time {}, long buffer:{:?}", median, long_buffer.iter().collect::<heapless::Vec<&u32, BUFFER_SIZE>>()).unwrap();
-                        socket.send(IpAddress::Ipv4(SEND_ADDRESS), SEND_PORT, s.as_bytes()).unwrap();
+                        
+                        write!(s, "did NOT trigger with fall time:{}\nlong buffer:{:?}\nshort buffer:{:?}", 
+                               median, 
+                               long_buffer.iter().collect::<heapless::Vec<&u32, BUFFER_SIZE>>(),
+                               short_buffer
+                            ).unwrap();socket.send(IpAddress::Ipv4(SEND_ADDRESS), SEND_PORT, s.as_bytes()).unwrap();
                         let wait_end = SystemTimer::now() + SystemTimer::TICKS_PER_SECOND/4; // 250 ms
                         while SystemTimer::now() < wait_end {
                             socket.work();
