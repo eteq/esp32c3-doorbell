@@ -17,3 +17,6 @@ Cargo.lock
 plot.png
 
 __pycache__
+# notbooks are one-off analysis tools to not be in source control
+.ipynb_checkpoints
+*.ipynb
